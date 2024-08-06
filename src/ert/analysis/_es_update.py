@@ -310,6 +310,7 @@ def _get_obs_and_measure_data(
     observation_keys = []
     observation_values = []
     observation_errors = []
+    observation_groups = []
     observations = source_fs.experiment.observations
     for obs in selected_observations:
         observation = observations[obs.name]
@@ -336,6 +337,10 @@ def _get_obs_and_measure_data(
         observation_keys.append([obs.name] * filtered_response["observations"].size)
         observation_values.append(filtered_response["observations"].data.ravel())
         observation_errors.append(filtered_response["std"].data.ravel())
+        observation_groups.append(
+            [filtered_response["group"].data]
+            * len(filtered_response.observations.data.ravel())
+        )
         measured_data.append(
             filtered_response["values"]
             .transpose(..., "realization")
@@ -347,6 +352,7 @@ def _get_obs_and_measure_data(
         np.concatenate(observation_values),
         np.concatenate(observation_errors),
         np.concatenate(observation_keys),
+        np.concatenate(observation_groups),
     )
 
 
@@ -367,7 +373,7 @@ def _load_observations_and_responses(
         List[ObservationAndResponseSnapshot],
     ],
 ]:
-    S, observations, errors, obs_keys = _get_obs_and_measure_data(
+    S, observations, errors, obs_keys, obs_groups = _get_obs_and_measure_data(
         source_fs,
         selected_observations,
         iens_ative_index,
@@ -436,6 +442,7 @@ def _load_observations_and_responses(
     return S[obs_mask], (
         observations[obs_mask],
         scaled_errors[obs_mask],
+        obs_groups[obs_mask],
         update_snapshot,
     )
 
@@ -549,6 +556,294 @@ def _copy_unupdated_parameters(
             target_fs.save_parameters(parameter_group, realization, ds)
 
 
+def print_out_var(var_name, var):
+    type_string = str(type(var))
+    if "numpy.ndarray" in type_string:
+        type_string += f" {var.shape}"
+
+    print(f"{var_name} [{type_string}]: {var}")
+
+
+def analysis_MIES(
+    updatestep: UpdateConfiguration,
+    rng: np.random.Generator,
+    module: ESSettings,
+    alpha: float,
+    std_cutoff: float,
+    global_scaling: float,
+    smoother_snapshot: SmootherSnapshot,
+    ens_mask: npt.NDArray[np.bool_],
+    source_fs: EnsembleReader,
+    target_fs: EnsembleAccessor,
+    progress_callback: Callable[[AnalysisEvent], None],
+    misfit_process: bool,
+) -> None:
+    iens_active_index = np.flatnonzero(ens_mask)
+
+    ensemble_size = ens_mask.sum()
+    updated_parameter_groups = []
+
+    def adaptive_localization_progress_callback(
+        iterable: Sequence[T],
+    ) -> TimedIterator[T]:
+        return TimedIterator(iterable, progress_callback)
+
+    for update_step in updatestep:
+        updated_parameter_groups.extend(
+            [param_group.name for param_group in update_step.parameters]
+        )
+
+        progress_callback(
+            AnalysisStatusEvent(msg="Loading observations and responses..")
+        )
+        (
+            S,
+            (
+                observation_values,
+                observation_errors,
+                observation_groups,
+                update_snapshot,
+            ),
+        ) = _load_observations_and_responses(
+            source_fs,
+            alpha,
+            std_cutoff,
+            global_scaling,
+            iens_active_index,
+            update_step.observations,
+            misfit_process,
+            update_step.name,
+        )
+
+        mies_Y_obs = observation_values
+        mies_Yf = S  # dimension N_obs x N_ensemble
+        mies_alpha = global_scaling
+
+        print_out_var("mies_alpha", mies_alpha)
+
+        smoother_snapshot.update_step_snapshots[update_step.name] = update_snapshot
+
+        num_obs = len(observation_values)
+
+        smoother_es = ies.ESMDA(
+            covariance=observation_errors**2,
+            observations=observation_values,
+            alpha=1,  # The user is responsible for scaling observation covariance (esmda usage)
+            seed=rng,
+            inversion=module.inversion,
+        )
+        truncation = module.enkf_truncation
+
+        if module.localization:
+            smoother_adaptive_es = AdaptiveESMDA(
+                covariance=observation_errors**2,
+                observations=observation_values,
+                seed=rng,
+            )
+
+            # Pre-calculate cov_YY
+            cov_YY = np.cov(S)
+
+            D = smoother_adaptive_es.perturb_observations(
+                ensemble_size=ensemble_size, alpha=1.0
+            )
+
+        else:
+            # # Compute transition matrix so that
+            # # X_posterior = X_prior @ T
+            # T = smoother_es.compute_transition_matrix(
+            #     Y=S, alpha=1.0, truncation=truncation
+            # )
+            # # Add identity in place for fast computation
+            # np.fill_diagonal(T, T.diagonal() + 1)
+
+            # We have Y and Yf
+            # Compute Yf mean
+            y_f_mean = np.mean(mies_Yf, axis=1)
+            # Compute Cf
+            Cf = (mies_Yf - y_f_mean[:, np.newaxis]) / np.sqrt(mies_Yf.shape[1] - 1)
+            # Compute Sk - dictionary of observation group and D
+            groups = np.unique(observation_groups)
+            S_dict_scaled = {}
+            D_diagonal = np.zeros(len(observation_groups))
+            for group in groups:
+                indices = np.where(observation_groups == group)
+                m_k = len(indices)
+                y_k = mies_Y_obs[indices]
+                y_bar_fk = y_f_mean[indices]
+                observation_residual_k = y_k - y_bar_fk
+                # S_k scaled is S_k/M_k from the paper/andreas.pdf
+                S_dict_scaled[group] = np.sum(observation_residual_k**2) / m_k
+                D_diagonal[indices] = (
+                    mies_alpha * np.sum(observation_residual_k**2) / m_k
+                )
+
+            # Compute D
+            D = np.diag(D_diagonal)
+
+            # Pre-compute CfT (Cf CfT  + D ) ^-1  --> T
+            T = Cf.T @ np.linalg.inv(Cf @ Cf.T + D)
+            # Compute UV from SVD
+            U, sigma_v, VT = np.linalg.svd(np.identity(ensemble_size) - T @ Cf)
+            sigma = np.diag(np.sqrt(sigma_v))
+
+        for param_group in update_step.parameters:
+            source: Union[EnsembleReader, EnsembleAccessor]
+            if target_fs.has_parameter_group(param_group.name):
+                source = target_fs
+            else:
+                source = source_fs
+            temp_storage = _create_temporary_parameter_storage(
+                source, iens_active_index, param_group.name
+            )
+            if module.localization:
+                num_params = temp_storage[param_group.name].shape[0]
+
+                # Calculate adaptive batch size.
+                # Adaptive Localization calculates the cross-covariance between
+                # parameters and responses.
+                # Cross-covariance is a matrix with shape num_params x num_obs
+                # which may be larger than memory.
+
+                # From `psutil` documentation:
+                # - available:
+                # the memory that can be given instantly to processes without the
+                # system going into swap.
+                # This is calculated by summing different memory values depending
+                # on the platform and it is supposed to be used to monitor actual
+                # memory usage in a cross platform fashion.
+                available_memory_bytes = psutil.virtual_memory().available
+                memory_safety_factor = 0.8
+                bytes_in_float64 = 8
+                batch_size = min(
+                    int(
+                        np.floor(
+                            available_memory_bytes
+                            * memory_safety_factor
+                            / (num_obs * bytes_in_float64)
+                        )
+                    ),
+                    num_params,
+                )
+
+                batches = _split_by_batchsize(np.arange(0, num_params), batch_size)
+
+                log_msg = f"Running localization on {num_params} parameters, {num_obs} responses, {ensemble_size} realizations and {len(batches)} batches"
+                _logger.info(log_msg)
+                progress_callback(AnalysisStatusEvent(msg=log_msg))
+
+                start = time.time()
+                for param_batch_idx in batches:
+                    X_local = temp_storage[param_group.name][param_batch_idx, :]
+                    temp_storage[param_group.name][param_batch_idx, :] = (
+                        smoother_adaptive_es.assimilate(
+                            X=X_local,
+                            Y=S,
+                            D=D,
+                            alpha=1.0,  # The user is responsible for scaling observation covariance (esmda usage)
+                            correlation_threshold=module.correlation_threshold,
+                            cov_YY=cov_YY,
+                            progress_callback=adaptive_localization_progress_callback,
+                        )
+                    )
+                _logger.info(
+                    f"Adaptive Localization of {param_group} completed in {(time.time() - start) / 60} minutes"
+                )
+
+            else:
+                # Use low-level ies API to allow looping over parameters
+                if active_indices := param_group.index_list:
+                    # The batch of parameters
+                    X_local = temp_storage[param_group.name][active_indices, :]
+
+                    # Compute ensemble parameter mean x_f_mean
+                    x_f_mean = np.mean(X_local, axis=1)
+
+                    # Compute Af
+                    Af = (X_local - x_f_mean[:, np.newaxis]) / np.sqrt(
+                        ensemble_size - 1
+                    )
+
+                    # Compute Kalman Gain
+                    K = Af @ T
+
+                    # Update ensemble parameter mean x_bar_a
+                    x_a_mean = x_f_mean + K @ (observation_values - y_f_mean)
+
+                    # Compute updated parameter anomaly matrix A^a
+                    Aa = Af @ U @ np.diag(np.sqrt(sigma_v)) @ VT
+
+                    # Compute updated parameter ensemble Ea
+                    Ea = x_a_mean[:, np.newaxis] + Aa * np.sqrt(ensemble_size - 1)
+
+                    # Update manually using global transition matrix T
+                    temp_storage[param_group.name][active_indices, :] = Ea
+
+                    # # Update manually using global transition matrix T
+                    # temp_storage[param_group.name][active_indices, :] = X_local @ T
+
+                else:
+                    # The batch of parameters
+                    X_local = temp_storage[param_group.name]
+
+                    # Compute ensemble parameter mean x_f_mean
+                    x_f_mean = np.mean(X_local, axis=1)
+
+                    # Compute Af
+                    Af = (X_local - x_f_mean[:, np.newaxis]) / np.sqrt(
+                        ensemble_size - 1
+                    )
+
+                    # Compute Kalman Gain
+                    K = Af @ T
+
+                    # Update ensemble parameter mean x_bar_a
+                    x_a_mean = x_f_mean + K @ (observation_values - y_f_mean)
+
+                    # Compute updated parameter anomaly matrix A^a
+                    Aa = Af @ U @ np.diag(np.sqrt(sigma_v)) @ VT
+
+                    # Compute updated parameter ensemble Ea
+                    Ea = x_a_mean[:, np.newaxis] + Aa * np.sqrt(ensemble_size - 1)
+
+                    # Update manually using global transition matrix T
+                    temp_storage[param_group.name] = Ea
+
+                    # # Update manually using global transition matrix T
+                    # temp_storage[param_group.name] = X_local @ T
+
+            log_msg = f"Storing data for {param_group.name}.."
+            _logger.info(log_msg)
+            progress_callback(AnalysisStatusEvent(msg=log_msg))
+            start = time.time()
+            _save_temp_storage_to_disk(target_fs, temp_storage, iens_active_index)
+            _logger.info(
+                f"Storing data for {param_group.name} completed in {(time.time() - start) / 60} minutes"
+            )
+
+        _copy_unupdated_parameters(
+            list(source_fs.experiment.parameter_configuration.keys()),
+            updated_parameter_groups,
+            iens_active_index,
+            source_fs,
+            target_fs,
+        )
+
+        _update_with_row_scaling(
+            update_step=update_step,
+            source_fs=source_fs,
+            target_fs=target_fs,
+            iens_active_index=iens_active_index,
+            S=S,
+            observation_errors=observation_errors,
+            observation_values=observation_values,
+            truncation=truncation,
+            inversion_type=module.inversion,
+            progress_callback=progress_callback,
+            rng=rng,
+        )
+
+
 def analysis_ES(
     updatestep: UpdateConfiguration,
     rng: np.random.Generator,
@@ -586,6 +881,7 @@ def analysis_ES(
             (
                 observation_values,
                 observation_errors,
+                _,
                 update_snapshot,
             ),
         ) = _load_observations_and_responses(
@@ -786,6 +1082,7 @@ def analysis_IES(
             (
                 observation_values,
                 observation_errors,
+                _,
                 update_snapshot,
             ),
         ) = _load_observations_and_responses(
@@ -973,7 +1270,7 @@ def smoother_update(
         global_scaling,
     )
 
-    analysis_ES(
+    analysis_MIES(
         updatestep,
         rng,
         es_settings,

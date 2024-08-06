@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 class ObsVector:
     observation_type: EnkfObservationImplementationType
     observation_key: str
+    observation_group: int
     data_key: str
     observations: Dict[Union[int, datetime], Union[GenObservation, SummaryObservation]]
 
@@ -40,6 +41,7 @@ class ObsVector:
                         {
                             "observations": (["report_step", "index"], [node.values]),
                             "std": (["report_step", "index"], [node.stds]),
+                            "group": self.observation_group,
                         },
                         coords={"index": node.indices, "report_step": [time_step]},
                     )
@@ -63,6 +65,7 @@ class ObsVector:
                 {
                     "observations": (["name", "time"], [observations]),
                     "std": (["name", "time"], [errors]),
+                    "group": self.observation_group,
                 },
                 coords={"time": dates, "name": [self.observation_key]},
                 attrs={"response": "summary"},

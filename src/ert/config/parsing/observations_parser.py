@@ -90,6 +90,7 @@ class GenObsValues(DateDict):
     INDEX_LIST: NotRequired[str]
     INDEX_FILE: NotRequired[str]
     OBS_FILE: NotRequired[str]
+    GROUP: NotRequired[int]
 
 
 GenObsDeclaration = Tuple[
@@ -287,6 +288,7 @@ def _validate_history_values(
     error_mode: ErrorModes = "RELMIN"
     error = 0.1
     error_min = 0.1
+    group = -1
     segment = []
     for key, value in inp.items():
         if key == "ERROR":
@@ -297,6 +299,8 @@ def _validate_history_values(
             error_mode = validate_error_mode(value)
         elif key == "SEGMENT":
             segment.append((value[0], _validate_segment_dict(key, value[1])))
+        elif key == "GROUP":
+            group = validate_positive_int(value, key)
         else:
             raise _unknown_key_error(key, name_token)
 
@@ -305,6 +309,7 @@ def _validate_history_values(
         "ERROR": error,
         "ERROR_MIN": error_min,
         "SEGMENT": segment,
+        "GROUP": group,
     }
 
 
@@ -316,6 +321,7 @@ def _validate_summary_values(
 
     date_dict: DateDict = {}
     float_values: Dict[str, float] = {"ERROR_MIN": 0.1}
+    group = -1
     for key, value in inp.items():
         if key == "RESTART":
             date_dict["RESTART"] = validate_positive_int(value, key)
@@ -331,6 +337,8 @@ def _validate_summary_values(
             summary_key = value
         elif key == "DATE":
             date_dict["DATE"] = value
+        elif key == "GROUP":
+            group = validate_positive_int(value, key)
         else:
             raise _unknown_key_error(key, name_token)
     if "VALUE" not in float_values:
@@ -346,6 +354,7 @@ def _validate_summary_values(
         "ERROR_MIN": float_values["ERROR_MIN"],
         "KEY": summary_key,
         "VALUE": float_values["VALUE"],
+        "GROUP": group,
         **date_dict,
     }
 
@@ -415,6 +424,8 @@ def _validate_gen_obs_values(
             output[str(key)] = filename  # type: ignore
         elif key == "DATA":
             output["DATA"] = value
+        elif key == "GROUP":
+            output["GROUP"] = validate_positive_int(value, key)
         else:
             raise _unknown_key_error(key, name_token)
     if "VALUE" in output and "ERROR" not in output:

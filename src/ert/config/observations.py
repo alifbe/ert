@@ -71,6 +71,24 @@ class EnkfObs:
             ]
         )
 
+    def getGroupList(self) -> List[int]:
+        """
+        Will return a list of observation group
+        """
+        return sorted(
+            list(set(obs.observation_group for _, obs in self.obs_vectors.items()))
+        )
+
+    def getGroupKeys(self, group: int) -> List[str]:
+        """
+        Will return a list of all the observation keys that belong to the group
+        """
+        return sorted(
+            key
+            for key, obs in self.obs_vectors.items()
+            if obs.observation_group == group
+        )
+
     @staticmethod
     def _handle_error_mode(
         values: "npt.ArrayLike",
@@ -301,6 +319,7 @@ class EnkfObs:
             obs_key: ObsVector(
                 EnkfObservationImplementationType.SUMMARY_OBS,
                 summary_key,
+                summary_dict.get("GROUP",-1),
                 "summary",
                 {date: SummaryObservation(summary_key, obs_key, value, std_dev)},
             )
@@ -429,6 +448,7 @@ class EnkfObs:
             obs_key: ObsVector(
                 EnkfObservationImplementationType.GEN_OBS,
                 obs_key,
+                general_observation.get("GROUP",-1),
                 config_node.name,
                 {
                     restart: cls._create_gen_obs(
